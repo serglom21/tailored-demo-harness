@@ -1,0 +1,140 @@
+# Worked example — fictional account "Acme Pay"
+version: 1
+status: draft
+
+account:
+  name: Acme Pay
+  slug: acme-pay
+  vertical: fintech
+  compelling_event: "Checkout conversion dropped ~2% last quarter; they suspect Adyen timeouts but can't prove it"
+  sources:
+    - "Gong 2026-09-12 — Discovery (CTO, Staff Eng)"
+    - "Notion — Acme Pay opp page, POC success criteria"
+
+mode: app
+
+stack:
+  frontend: nextjs
+  backend: fastapi
+  mobile: null
+
+demo_env:
+  org: demo
+  projects:
+    frontend: acme-pay-web
+    backend: acme-pay-api
+  environment: demo-acme-pay
+  tags:
+    se: sergio
+    account: acme-pay
+
+journeys:
+  - id: checkout
+    name: Checkout
+    why: "Compelling event — conversion drop they attribute to payment provider timeouts"
+    source: "Gong 2026-09-12"
+    slo: { p95_ms: 1500, error_rate: 0.02 }
+    spans:
+      - name: checkout.submit
+        op: ui.action
+        layer: frontend
+        attributes:
+          - { key: checkout.payment_provider, type: string, values: [stripe, adyen, paypal], group_by: true }
+          - { key: checkout.cart_value_usd, type: number, example: 129.99, range: [5, 900] }
+          - { key: user.email, type: string, pii: true }
+      - name: payment.authorize
+        op: function
+        layer: backend
+        attributes:
+          - { key: checkout.payment_provider, type: string, values: [stripe, adyen, paypal], group_by: true }
+          - { key: payment.retry_count, type: number, range: [0, 3] }
+      - name: payment.gateway
+        op: http.client
+        layer: backend
+        attributes:
+          - { key: checkout.payment_provider, type: string, values: [stripe, adyen, paypal], group_by: true }
+    metrics:
+      - { name: checkout.completed, type: counter, unit: none, attributes: [checkout.payment_provider] }
+    failures:
+      - id: payment-timeout
+        span: payment.gateway
+        rate: 0.08
+        error: PaymentGatewayTimeout
+        message: "Gateway did not respond within 5000ms"
+        latency_ms: 5000
+        when: { checkout.payment_provider: adyen }
+    traffic:
+      weight: 3
+      steps:
+        - { method: GET, path: /api/cart }
+        - method: POST
+          path: /api/checkout
+          body: { provider: "{checkout.payment_provider}", amount: "{checkout.cart_value_usd}" }
+
+  - id: kyc
+    name: KYC onboarding
+    why: "Second-biggest drop-off; KYC vendor latency is a black box today"
+    source: "Notion — POC success criteria #2"
+    slo: { p95_ms: 4000, error_rate: 0.05 }
+    spans:
+      - name: kyc.verify
+        op: function
+        layer: backend
+        attributes:
+          - { key: kyc.vendor, type: string, values: [onfido, persona], group_by: true }
+          - { key: kyc.country, type: string, values: [US, CA, MX, BR, GB], group_by: true }
+          - { key: kyc.document_type, type: string, values: [passport, drivers_license, national_id], group_by: true }
+    logs:
+      - { message: "kyc verification rejected", level: warn, attributes: [kyc.vendor, kyc.country] }
+    failures:
+      - id: kyc-vendor-5xx
+        span: kyc.verify
+        rate: 0.05
+        error: KycVendorUnavailable
+        message: "KYC vendor returned 503"
+        when: { kyc.vendor: persona }
+    traffic:
+      weight: 1
+      steps:
+        - method: POST
+          path: /api/kyc/verify
+          body: { vendor: "{kyc.vendor}", country: "{kyc.country}", document: "{kyc.document_type}" }
+
+dashboards:
+  - title: "Acme Pay — Checkout & KYC health"
+    widgets:
+      - title: "p95 gateway latency by provider"
+        display: line
+        span: payment.gateway
+        aggregate: p95(span.duration)
+        group_by: [checkout.payment_provider]
+      - title: "Checkout submits"
+        display: big_number
+        span: checkout.submit
+        aggregate: count()
+      - title: "KYC p95 by vendor and country"
+        display: table
+        span: kyc.verify
+        aggregate: p95(span.duration)
+        group_by: [kyc.vendor, kyc.country]
+        limit: 10
+
+alerts:
+  - { name: "Checkout p95 above SLO", span: checkout.submit, aggregate: p95(span.duration), threshold: 1500, window_min: 10 }
+  - { name: "Gateway p95 above 3s", span: payment.gateway, aggregate: p95(span.duration), threshold: 3000, window_min: 10 }
+
+demo_flow:
+  - journey: checkout
+    show: dashboard
+    say: "This is checkout latency split by payment provider — Adyen's tail is the outlier."
+    ask: "Is provider the first thing your on-call would slice by?"
+    quote: "We think it's Adyen, but we can't prove it."
+  - journey: checkout
+    show: trace
+    say: "One slow checkout, end to end — browser click to the gateway call."
+  - journey: checkout
+    show: issue
+    say: "Same failure as an issue, already filterable by provider, with the replay attached."
+  - journey: kyc
+    show: explore
+    say: "KYC vendor latency by country — the black box you mentioned, now queryable."
